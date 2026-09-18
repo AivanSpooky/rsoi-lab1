@@ -1,4 +1,5 @@
 name: GitHub Classroom Workflow
+
 on:
   push:
     branches:
@@ -6,16 +7,147 @@ on:
   pull_request:
     branches:
       - master
+
+permissions:
+  contents: read
+  packages: write
+  checks: write
+
+env:
+  DOTNET_VERSION: "10.0.x"
+  DOTNET_NOLOGO: "true"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+  LOCAL_IMAGE: person-service:local
+  POSTMAN_ENVIRONMENT: "postman/[inst][heroku] Lab1.postman_environment.json"
+  SERVICE_URL: ${{ vars.SERVICE_URL }}
+
 jobs:
   build:
     name: Autograding
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # TODO build, test and deploy project
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore PersonService.slnx
+
+      - name: Build
+        run: dotnet build PersonService.slnx --configuration Release --no-restore
+
+      - name: Unit tests
+        run: >
+          dotnet test PersonService.slnx
+          --configuration Release
+          --no-build
+          --logger "trx;LogFileName=test-results.trx"
+          --results-directory artifacts/test-results
+
+      - name: Publish unit test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: artifacts/test-results
+          if-no-files-found: ignore
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.LOCAL_IMAGE }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start the stack
+        run: docker compose up --detach --no-build
+
+      - name: Wait for the local service
+        env:
+          BASE_URL: http://localhost:8080
+        run: bash .github/ci/wait-for-service.sh
+
+      - name: Local API tests
+        uses: matt-ball/newman-action@master
+        with:
+          collection: postman/[inst] Lab1.postman_collection.json
+          environment: postman/[inst][local] Lab1.postman_environment.json
+          delayRequest: 100
+          reporters: '[ "cli" ]'
+
+      - name: Dump container logs
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down --volumes
+
+      - name: Check whether Render is configured
+        id: deploy-config
+        if: github.event_name == 'push'
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+        run: |
+          if [[ -n "${RENDER_API_KEY}" && -n "${RENDER_SERVICE_ID}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::RENDER_API_KEY / RENDER_SERVICE_ID are not set, skipping deploy"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        id: push
+        if: github.event_name == 'push'
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          docker tag "${LOCAL_IMAGE}" "${image}"
+          docker tag "${LOCAL_IMAGE}" "ghcr.io/${GITHUB_REPOSITORY,,}:latest"
+          docker push "${image}"
+          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:latest"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Render
+        if: steps.deploy-config.outputs.configured == 'true'
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          IMAGE_URL: ${{ steps.push.outputs.image }}
+        run: bash .github/ci/deploy-render.sh
+
+      - name: Point the Postman environment at the deployed service
+        if: env.SERVICE_URL != ''
+        run: |
+          jq --arg url "$SERVICE_URL" \
+            '(.values[] | select(.key == "baseUrl") | .value) = $url' \
+            "$POSTMAN_ENVIRONMENT" > environment.json
+          mv environment.json "$POSTMAN_ENVIRONMENT"
+
+      - name: Wait for the deployed service
+        if: env.SERVICE_URL != ''
+        env:
+          BASE_URL: ${{ vars.SERVICE_URL }}
+        run: bash .github/ci/wait-for-service.sh
 
       - name: Run API Tests
         uses: matt-ball/newman-action@master
@@ -29,7 +161,20 @@ jobs:
         uses: education/autograding@v1
         continue-on-error: true
 
+      - name: Check whether the autograder marker is configured
+        id: grader-config
+        env:
+          GOOGLE_TOKEN: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          if [[ -n "${GOOGLE_TOKEN}" ]] && jq empty <<< "${GOOGLE_TOKEN}" 2>/dev/null; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::GOOGLE_API_KEY is missing or is not a Google service account JSON, skipping the grader mark"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Github auto grader mark
+        if: steps.grader-config.outputs.configured == 'true'
         uses: Romanow/google-sheet-autograder-marker@v1.0
         with:
           google_token: ${{secrets.GOOGLE_API_KEY}}
